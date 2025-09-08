@@ -1,0 +1,1004 @@
+Option Compare Database
+Option Explicit
+
+Public g_ReportMonth As Date   ' <-- GLOBAL REPORT MONTH
+
+'=====================================================================
+' Excel constants (late-binding friendly)
+'=====================================================================
+Const xlDatabase               As Long = 1
+Const xlTabularRow             As Long = 1
+Const xlRowField               As Long = 1
+Const xlDataField              As Long = 4
+Const xlCenter                 As Long = -4108
+Const xlUp                     As Long = -4162
+Const xlToLeft                 As Long = -4159
+Const xlColumnField            As Long = 2
+Const xlOpenXMLWorkbook        As Long = 51 ' .xlsx
+Const xlLocalSessionChanges    As Long = 2  ' no overwrite prompt
+Const xlHidden                 As Long = -4142
+Const xlAscending              As Long = 1
+Const xlThemeColorAccent4      As Long = 8
+Const xlThemeColorAccent6      As Long = 10
+
+'=====================================================================
+' 1) Helper: remove illegal characters from a file name
+'=====================================================================
+Public Function CleanFileName(s As String) As String
+    Dim illegal As Variant, ch As Variant
+    illegal = Array("\", "/", ":", "*", "?", """", "<", ">", vbLf)
+    For Each ch In illegal
+        s = Replace(s, ch, "_")
+    Next ch
+    s = Trim(s)
+    Do While Right$(s, 1) = "." Or Right$(s, 1) = " "
+        s = Left$(s, Len(s) - 1)
+    Loop
+    CleanFileName = s
+End Function
+
+'=====================================================================
+' 5) GetOrCreateSheet – returns a Worksheet object.
+'=====================================================================
+Public Function GetOrCreateSheet(ByVal WB As Object, _
+                                 ByVal SheetName As String) As Object
+    Dim ws As Object
+    On Error Resume Next
+    Set ws = WB.Worksheets(SheetName)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        Set ws = WB.Worksheets.Add(After:=WB.Worksheets(WB.Worksheets.Count))
+        ws.Name = SheetName
+    End If
+    Const xlSheetVisible As Long = -1
+    If ws.Visible <> xlSheetVisible Then ws.Visible = xlSheetVisible
+    Set GetOrCreateSheet = ws
+End Function
+
+    '=====================================================================
+    ' Normalize a key for de-duplication (trims, fixes NBSP & tabs)
+    '=====================================================================
+    Public Function NormalizeKey(ByVal s As String) As String
+    
+        Dim t As String
+        t = CStr(s)
+        t = Replace(t, Chr(160), " ") ' NBSP -> space
+        t = Replace(t, vbTab, " ")    ' tabs -> space
+        NormalizeKey = Trim$(t)
+    End Function
+
+
+'---------------------------------------------------------------------
+' Build a safe full path for the Excel workbook (updated base name)
+'---------------------------------------------------------------------
+Public Function BuildFullPathSafe( _
+    savePath As String, _
+    custName As String) As String
+    
+    Dim fName As String, folderPath As String, fullPath As String
+    Dim yearVal As String, monthVal As String, monthFolder As String
+
+    ' Use global report month (set once in InitReportMonth)
+    yearVal = Format(g_ReportMonth, "yyyy")
+    monthVal = Format(g_ReportMonth, "mm")
+    monthFolder = yearVal & monthVal
+
+    ' Clean customer name
+    fName = CleanFileName(custName)
+    If Len(fName) = 0 Then Exit Function
+
+    ' Ensure base folder ends with "\"
+    folderPath = Trim(savePath)
+    If Right(folderPath, 1) <> "\" Then folderPath = folderPath & "\"
+
+    ' Build monthly folder path
+    folderPath = folderPath & monthFolder & "\"
+
+    ' Create folder if missing
+    If Dir(folderPath, vbDirectory) = "" Then
+        On Error Resume Next
+        MkDir folderPath
+        On Error GoTo 0
+    End If
+
+    ' Final filename: YYYYMM Analytische lijst [Customer_Name].xlsx
+    fullPath = folderPath & yearVal & monthVal & _
+               " Analytische lijst " & fName & ".xlsx"
+
+    If Len(fullPath) > 215 Then Exit Function
+    BuildFullPathSafe = fullPath
+End Function
+
+'=====================================================================
+' 3) Simple text-file logger (used for both Excel & PDF problems)
+'=====================================================================
+Public Sub LogProblem(ByVal custID As Long, _
+                      ByVal custName As String, _
+                      ByVal msg As String)
+    Dim logFile As String, txt As String
+    logFile = CurrentProject.Path & "\ExportLog.txt"
+    txt = Format(Now, "yyyy-mm-dd hh:nn:ss") & _
+          "  | CustID:" & custID & _
+          "  | CustName:" & custName & _
+          "  | " & msg & vbCrLf
+    On Error Resume Next
+    Dim f As Integer
+    f = FreeFile
+    Open logFile For Append As #f
+    Print #f, txt
+    Close #f
+    On Error GoTo 0
+End Sub
+
+'=====================================================================
+' 4) Log a PDF-specific problem (just forwards to LogProblem)
+'=====================================================================
+Private Sub LogPDFProblem(ByVal custID As Long, _
+                          ByVal custName As String, _
+                          ByVal msg As String)
+    LogProblem custID, custName, "PDF-merge: " & msg
+End Sub
+    '=====================================================================
+    ' 6) Set property for a range (font etc.)
+    '=====================================================================
+    Public Sub SetProperty(CelRan1 As String, CelRan2 As String, WB As Object, SheetName As String)
+        Dim targetRange As Object, addressStr As String
+        addressStr = CelRan1 & ":" & CelRan2
+        Set targetRange = WB.Sheets(SheetName).Range(addressStr)
+        With targetRange.Font
+            .Name = "Calibri"
+            .Size = 11
+            .Bold = False
+        End With
+    End Sub
+
+
+'=====================================================================
+' 7) Insert Company Logo (unchanged, only minor formatting)
+'=====================================================================
+Private Sub InsertCompanyLogo(ByVal CustomerEntity As String, ByVal xlOverview As Object)
+    Dim db As DAO.Database
+    Dim rsLogo As DAO.Recordset
+    Dim rsAttach As DAO.Recordset2
+    Dim tmpPath As String, tmpFile As String
+    Dim ext As String, baseName As String
+    Dim shp As Object
+    Dim crit As String
+    
+    Set db = CurrentDb
+    If Len(CustomerEntity) > 0 And IsNumeric(CustomerEntity) Then
+        crit = "WHERE CompanyID = " & CLng(CustomerEntity)
+    Else
+        crit = "WHERE CompanyID = '" & Replace(CustomerEntity, "'", "''") & "'"
+    End If
+    
+    Set rsLogo = db.OpenRecordset( _
+        "SELECT CompanyLogo FROM Company " & crit, _
+        dbOpenDynaset)
+    
+    If Not (rsLogo Is Nothing) Then
+        If Not rsLogo.EOF Then
+            If rsLogo.Fields("CompanyLogo").Type = dbAttachment Then
+                Set rsAttach = rsLogo.Fields("CompanyLogo").Value
+                If Not rsAttach Is Nothing Then
+                    If Not rsAttach.EOF Then
+                        tmpPath = Environ$("TEMP") & "\"
+                        If Len(Dir$(tmpPath, vbDirectory)) = 0 Then tmpPath = CurrentProject.Path & "\"
+                        On Error Resume Next
+                        baseName = rsAttach.Fields("FileName").Value
+                        On Error GoTo 0
+                        If Len(baseName) > 0 And InStrRev(baseName, ".") > 0 Then
+                            ext = Mid$(baseName, InStrRev(baseName, "."))
+                        Else
+                            ext = ".png"
+                        End If
+                        tmpFile = tmpPath & "CompanyLogo_" & Format$(Now, "yyyymmdd_hhnnss") & ext
+                        rsAttach.Fields("FileData").SaveToFile tmpFile
+                        
+                        Set shp = xlOverview.Shapes.AddPicture( _
+                            tmpFile, False, True, _
+                            xlOverview.Range("A2").Left, _
+                            xlOverview.Range("A2").Top, _
+                            100, 50)
+                        If Not shp Is Nothing Then
+                            Dim target As Object, maxW As Double, maxH As Double
+                            Set target = xlOverview.Range("A2:A6")
+                            maxW = target.Width: maxH = target.Height
+                            On Error Resume Next
+                            shp.LockAspectRatio = True
+                            If shp.Width > maxW Then shp.Width = maxW
+                            If shp.Height > maxH Then shp.Height = maxH
+                            shp.Left = target.Left + (maxW - shp.Width) / 2
+                            shp.Top = target.Top + (maxH - shp.Height) / 2
+                            On Error GoTo 0
+                        End If
+                        On Error Resume Next
+                        Kill tmpFile
+                        On Error GoTo 0
+                    End If
+                    rsAttach.Close
+                End If
+            End If
+        End If
+        rsLogo.Close
+    End If
+    Set rsAttach = Nothing: Set rsLogo = Nothing: Set db = Nothing
+End Sub
+
+'=====================================================================
+' 8) Pivot-order helper – returns an array of the values that appear
+'=====================================================================
+Private Function GetPivotOrder(ByVal xlOverview As Object) As Variant
+    Dim pt As Object, arr() As String, i As Long
+    On Error GoTo NoPivot
+    Set pt = xlOverview.PivotTables("PivotTable1")
+    With pt.DataBodyRange
+        If .Rows.Count = 0 Then GoTo NoPivot
+        ReDim arr(1 To .Rows.Count)
+        For i = 1 To .Rows.Count
+            arr(i) = CStr(.Cells(i, 1).Value)
+        Next i
+    End With
+    GetPivotOrder = arr
+    Exit Function
+NoPivot:
+    GetPivotOrder = Array()
+End Function
+
+'=====================================================================
+' 9) Clean the External Document Nr. so it matches the PDF file name
+'=====================================================================
+Private Function CleanExternalDocNr(ByVal s As String) As String
+    Dim tmp As String, parts() As String
+    tmp = Trim(s)
+    If InStr(tmp, " ") > 0 Then
+        parts = Split(tmp, " ")
+        If IsNumeric(parts(0)) Then tmp = Mid(tmp, Len(parts(0)) + 2)
+    End If
+    tmp = Replace(tmp, "/", "-")
+    CleanExternalDocNr = tmp
+End Function
+
+'---------------------------------------------------------------------
+' Build the UNC folder that holds the source PDF files. (unchanged)
+'---------------------------------------------------------------------
+Private Function BuildPDFFolder(ByVal postingMonth As Date, _
+                                ByVal custName As String) As String
+    Dim y As String, m As String
+    y = Format(postingMonth, "yyyy")
+    m = Format(postingMonth, "mm")
+    BuildPDFFolder = "\\itglo.net\public\EMEA\BE-KI\DataShares\Share Boekhouding CGI Kallo\" & _
+                     "Consumabiles for split\CLA\2025\" & y & m & "\" & CleanFileName(custName)
+End Function
+
+'=====================================================================
+' 12) Parse Posting Month into a true Date value (unchanged core)
+'=====================================================================
+Private Function ParsePostingMonthToDate(v As Variant) As Date
+    On Error GoTo ErrP
+    If IsDate(v) Then
+        ParsePostingMonthToDate = DateSerial(Year(CDate(v)), month(CDate(v)), 1)
+        Exit Function
+    End If
+    Dim s As String, parts() As String
+    s = Trim(CStr(v))
+    If s = "" Then Err.Raise vbObjectError + 1, , "Empty Posting Month"
+    If IsNumeric(s) And Len(s) = 6 Then
+        ParsePostingMonthToDate = DateSerial(CInt(Left(s, 4)), CInt(Mid(s, 5, 2)), 1)
+        Exit Function
+    End If
+    If InStr(s, "-") > 0 Then
+        parts = Split(s, "-")
+    ElseIf InStr(s, "/") > 0 Then
+        parts = Split(s, "/")
+    ElseIf InStr(s, ".") > 0 Then
+        parts = Split(s, ".")
+    End If
+    If UBound(parts) >= 1 Then
+        ParsePostingMonthToDate = DateSerial(CInt(parts(0)), CInt(parts(1)), 1)
+        Exit Function
+    End If
+    If IsDate(s) Then
+        ParsePostingMonthToDate = DateSerial(Year(CDate(s)), month(CDate(s)), 1)
+        Exit Function
+    End If
+ErrP:
+    Err.Raise vbObjectError + 2, , "Cannot parse Posting Month: " & CStr(v)
+End Function
+
+
+'=====================================================================
+' Return the worksheet column index where a row-field's labels appear
+' Works for Compact/Outline/Tabular and adapts if the pivot moves.
+'=====================================================================
+Public Function FieldLabelColumn(pt As Object, fieldName As String) As Long
+
+    On Error Resume Next
+    FieldLabelColumn = pt.PivotFields(fieldName).LabelRange.Column
+    If FieldLabelColumn = 0 Then FieldLabelColumn = pt.TableRange1.Column
+    On Error GoTo 0
+End Function
+
+'=====================================================================
+' COLOR CONFIG — set your RGB colors for subtotal rows here
+' Change the numbers to whatever you need, e.g. RGB(255, 200, 0)
+'=====================================================================
+Private Function ColorSeg4() As Long
+
+    ' example: pale yellow
+    ColorSeg4 = RGB(226, 239, 218)
+End Function
+
+Private Function ColorSeg5() As Long
+    ' example: pale blue
+    ColorSeg5 = RGB(255, 242, 204)
+End Function
+
+
+'=====================================================================
+' 13) Build & run the combined GL-check query (unchanged)
+'=====================================================================
+Public Sub BuildAndRun_GLCombinationCheckFromTable()
+    Const cDefTable As String = "tblGLCheckDefs"
+    Const cTempTable As String = "Temp_CheckDefs"
+    Const cResultQry As String = "Check_GL_Combined_qry"
+    Dim db As DAO.Database
+    Dim rsDefs As DAO.Recordset
+    Dim sqlBlock As String, insertSQL As String
+    Dim colList As String
+
+    colList = "ID, Ledger, [Segment8 (Dim7)] AS Segment8, Customer, Segment5, " & _
+              "[GL Account Nr], Segment4, [External Document Nr], Amount"
+
+    Set db = CurrentDb
+    ' Clear the temporary table
+    db.Execute "DELETE FROM " & cTempTable, dbFailOnError
+
+    ' Open the definition table
+    Set rsDefs = db.OpenRecordset( _
+        "SELECT ConditionNr, Description, WhereClause " & _
+        "FROM " & cDefTable & " ORDER BY ConditionNr;", dbOpenSnapshot)
+
+    If rsDefs.EOF Then
+        MsgBox "Definition table '" & cDefTable & "' is empty.", vbExclamation
+        GoTo CleanExit
+    End If
+
+    ' Loop through each condition and insert matching records into Temp_CheckDefs
+    Do While Not rsDefs.EOF
+        insertSQL = "INSERT INTO " & cTempTable & " (ID, Ledger, Segment8, Customer, Segment5, [GL Account Nr], Segment4, [External Document Nr], Amount, ConditionNr, ConditionDesc) " & _
+                    "SELECT ID, Ledger, [Segment8 (Dim7)], Customer, Segment5, [GL Account Nr], Segment4, [External Document Nr], Amount, " & _
+                    rsDefs!conditionNr & ", '" & Replace(Nz(rsDefs!Description, ""), "'", "''") & "' " & _
+                    "FROM Consumables WHERE " & rsDefs!whereClause
+        On Error Resume Next
+        db.Execute insertSQL, dbFailOnError
+        On Error GoTo 0
+        rsDefs.MoveNext
+    Loop
+
+    ' Open the review form
+    DoCmd.OpenQuery ("consumablesTempCheckDefs_qry")
+
+CleanExit:
+    If Not rsDefs Is Nothing Then rsDefs.Close: Set rsDefs = Nothing
+    Set db = Nothing
+End Sub
+
+'=====================================================================
+' Helpers for Pivot adjustments (Analit_R integration)
+'=====================================================================
+Private Sub PivotHideIfExists(pt As Object, fieldName As String)
+    On Error Resume Next
+    pt.PivotFields(fieldName).Orientation = xlHidden
+    On Error GoTo 0
+End Sub
+
+Private Sub PivotEnsureRowField(pt As Object, fieldName As String, Optional pos As Variant)
+    On Error Resume Next
+    With pt.PivotFields(fieldName)
+        .Orientation = xlRowField
+        If Not IsMissing(pos) Then .Position = pos
+    End With
+    On Error GoTo 0
+End Sub
+'=====================================================================
+'  Month reporting initiation
+'=====================================================================
+Sub InitReportMonth()
+    Dim db As DAO.Database
+    Dim rsMonth As DAO.Recordset
+
+    Set db = CurrentDb
+    Set rsMonth = db.OpenRecordset("SELECT Max([Posting Date]) AS MaxDate FROM Consumables WHERE [Posting Date] Is Not Null", dbOpenSnapshot)
+    
+    If Not rsMonth.EOF And Not IsNull(rsMonth!MaxDate) Then
+        g_ReportMonth = rsMonth!MaxDate
+    Else
+        g_ReportMonth = Date  ' fallback to current month
+    End If
+
+    rsMonth.Close
+    Set rsMonth = Nothing
+    Set db = Nothing
+End Sub
+
+'=====================================================================
+' 15) MAIN ROUTINE – Export Excel + Merge PDFs (CLA + Analit_R + specs)
+'=====================================================================
+Public Sub ExportAnalytical_CLA()
+    On Error GoTo ErrHandler
+    
+    Call InitReportMonth
+
+    Dim db As DAO.Database
+    Dim rsCust As DAO.Recordset
+    Dim rsData As DAO.Recordset
+    Dim rsScan As DAO.Recordset
+
+    Dim xlApp As Object ' Excel.Application (late-bound)
+    Dim xlWB As Object
+    Dim xlData As Object
+    Dim xlOverview As Object
+    Dim pc As Object
+    Dim pt As Object
+    Dim destRange As Object
+    Dim srcRange As Object
+
+    Dim savePath As String, monthFolder As String
+    Dim fullPath As String
+    Dim yearVal As String, monthVal As String
+    Dim postingMonthMax As Date
+    Dim postingDateMin As Date, haveMinDate As Boolean
+    Dim pDate As Date, firstOfMinMonth As Date
+
+    Dim sqlData As String
+    Dim i As Long, j As Long
+    Dim lastRow As Long, lastCol As Long
+    Dim SourceDataStr As String
+
+    Dim seg5ListText As String
+
+    Set db = CurrentDb()
+    
+    ' *** CHANGED: Only customers where Customer_Entity = 'CLA'
+    Set rsCust = db.OpenRecordset( _
+        "SELECT * FROM Customer " & _
+        "WHERE Customer_Name Is Not Null AND Customer_Entity='CLA'", _
+        dbOpenDynaset)
+
+    Set xlApp = CreateObject("Excel.Application")
+    xlApp.Visible = False
+
+    Do While Not rsCust.EOF
+        
+        '-------------------------------------------------------------
+        ' Build the data-set for this customer
+        ' *** CHANGED: Removed Segment4 filtering entirely
+        '-------------------------------------------------------------
+        sqlData = "SELECT * FROM Consumables WHERE [Customer] = '" & _
+                  Replace(rsCust!Customer_Name, "'", "''") & "'"
+        Set rsData = db.OpenRecordset(sqlData, dbOpenDynaset)
+        If rsData.EOF Then
+            rsData.Close: Set rsData = Nothing
+            GoTo CloseWorkbookAndNext
+        End If
+
+        '-------------------------------------------------------------
+        ' Compute MAX Posting Month for folder naming + headers
+        ' and collect distinct Segment5 values + distinct Ledger suffixes
+        '-------------------------------------------------------------
+        Set rsScan = rsData.Clone
+        rsScan.MoveFirst
+
+        
+        Dim havePM As Boolean: havePM = False
+        Dim tmpPM As Date
+        haveMinDate = False
+
+
+        ' Collect distinct Segment5 into Dictionary
+        Dim dSeg5 As Object: Set dSeg5 = CreateObject("Scripting.Dictionary")
+        dSeg5.CompareMode = 1 ' TextCompare
+
+        ' Collect ledger suffixes (last 3 chars)
+        Dim ledgers As Collection, ledgerVal As String, tempVal As String
+        Set ledgers = New Collection
+
+        Do Until rsScan.EOF
+            ' Max Posting Month
+            If Not IsNull(rsScan![Posting Month]) Then
+                tmpPM = ParsePostingMonthToDate(rsScan![Posting Month])
+                If Not havePM Then
+                    postingMonthMax = tmpPM
+                    havePM = True
+                ElseIf tmpPM > postingMonthMax Then
+                    postingMonthMax = tmpPM
+                End If
+            End If
+            
+
+            
+        
+        ' Segment5 collection (normalized to avoid visually-equal duplicates)
+                 If Not IsNull(rsScan!Segment5) Then
+                     tempVal = NormalizeKey(CStr(rsScan!Segment5))
+                     If tempVal <> "" Then
+                         If Not dSeg5.exists(tempVal) Then dSeg5.Add tempVal, True
+                     End If
+                 End If
+        
+                ' Track MIN([Posting Date]) for "date from"
+                If Not IsNull(rsScan![Posting Date]) Then
+                    pDate = CDate(rsScan![Posting Date])
+                    If Not haveMinDate Then
+                        postingDateMin = pDate
+                        haveMinDate = True
+                    ElseIf pDate < postingDateMin Then
+                        postingDateMin = pDate
+                    End If
+                End If
+ 
+            ' Ledger suffixes (last 3)
+            tempVal = Trim$(Nz(rsScan!Ledger, ""))
+            If tempVal <> "" Then
+                ledgerVal = Right$(tempVal, 3)
+                On Error Resume Next
+                ledgers.Add ledgerVal, ledgerVal
+                On Error GoTo 0
+            End If
+
+            rsScan.MoveNext
+        Loop
+        rsScan.Close: Set rsScan = Nothing
+
+        
+        If Not havePM Then
+                 ' Fallback: use first record's posting month
+                 postingMonthMax = ParsePostingMonthToDate(rsData![Posting Month])
+             End If
+            If Not haveMinDate Then
+                ' Fallback: use first record's Posting Date if all null
+                postingDateMin = CDate(rsData![Posting Date])
+            End If
+            firstOfMinMonth = DateSerial(Year(postingDateMin), month(postingDateMin), 1)
+
+
+        yearVal = Format(postingMonthMax, "yyyy")
+        monthVal = Format(postingMonthMax, "mm")
+        monthFolder = yearVal & monthVal
+
+        
+        ' Build Segment5 list text (PIPE-delimited, UNIQUE)
+            seg5ListText = ""                              ' reset for this customer
+            If dSeg5.Count > 0 Then
+                Dim keys As Variant: keys = dSeg5.keys     ' unique keys
+                ' (Optional sort can be applied here – see note below)
+                seg5ListText = Join(keys, "|")
+            End If
+
+
+        Set dSeg5 = Nothing
+
+        ' Build ledger display strings
+        Dim ledgerList As String, ledgerList2 As String
+        ledgerList = "["
+        ledgerList2 = ""
+        For i = 1 To ledgers.Count
+            ledgerList = ledgerList & ledgers(i)
+            If i < ledgers.Count Then ledgerList = ledgerList & ","
+            ledgerList2 = ledgerList2 & "BE_BU_" & Right$(ledgers(i), 3)
+            If i < ledgers.Count Then ledgerList2 = ledgerList2 & ","
+        Next i
+        ledgerList = ledgerList & "]"
+
+        '-------------------------------------------------------------
+        ' Create workbook and write the raw data
+        '-------------------------------------------------------------
+        Set xlWB = xlApp.Workbooks.Add
+        On Error Resume Next
+        xlWB.Worksheets(1).Name = "Data"
+        On Error GoTo 0
+        Set xlData = xlWB.Worksheets("Data")
+
+        ' Headers row (25)
+        For j = 0 To rsData.Fields.Count - 1
+            xlData.Cells(25, j + 1).Value = rsData.Fields(j).Name
+        Next j
+        rsData.MoveFirst
+        xlData.Range("A26").CopyFromRecordset rsData
+
+        lastRow = xlData.Cells(xlData.Rows.Count, 1).End(xlUp).row
+        lastCol = xlData.Cells(25, xlData.Columns.Count).End(xlToLeft).Column
+        If lastRow < 26 Or lastCol < 1 Then
+            MsgBox "No valid data for customer: " & rsCust!Customer_Name, vbExclamation
+            GoTo CloseWorkbookAndNext
+        End If
+
+        '-------------------------------------------------------------
+        ' Header / formatting on Data sheet
+        '-------------------------------------------------------------
+        With xlData
+            .Range("A1:H1").Merge
+            .Range("A1:H1").HorizontalAlignment = xlCenter
+            .Range("A1").Value = "BE_050 Analytical - DIM 7-4-3-2 per month"
+            .Range("A1").Font.Name = "Calibri"
+            .Range("A1").Font.Size = 14
+            .Range("A1").Font.Bold = True
+            .Range("A1").ColumnWidth = 25.33
+
+            .Range("A7").Value = "Ledger"
+            .Range("A8").Value = "Posting Date From"
+            .Range("A9").Value = "Document Nr."
+            .Range("A10").Value = "G/L Account Nr."
+            .Range("A11").Value = "Segment1"
+            .Range("A12").Value = "Segment2"
+            .Range("A13").Value = "Segment3"
+            .Range("A14").Value = "Segment4"
+            .Range("A15").Value = "Segment5"
+            .Range("A16").Value = "Segment6"
+            .Range("A17").Value = "Segment7"
+            .Range("A18").Value = "Segment8"
+            .Range("A19").Value = "Segment9"
+            .Range("A20").Value = "Segment10"
+            .Range("A21").Value = "Include Adjustment Period"
+
+            .Range("B7").Value = "Primary"
+            .Range("B8").Value = firstOfMinMonth
+            .Range("B8").NumberFormat = "dd/mm/yyyy"
+            .Range("B11").Value = ledgerList
+            .Range("E8").Value = DateSerial(Year(postingMonthMax), month(postingMonthMax) + 1, 0)
+            .Range("E8").NumberFormat = "dd/mm/yyyy"
+
+            .Range("B16").Value = rsCust!Customer_Name
+
+            ' *** CHANGED per spec:
+            
+           .Range("B14").Value = ""             ' Data!B14 must be empty
+           .Range("B15").Value = seg5ListText   ' Data!B15 = UNIQUE PIPE list
+           .Range("B14:B15").WrapText = False   ' keep on one line
+
+
+            .Range("B21").Value = "Yes"
+
+            .Range("C6:G6").Merge
+            .Range("C6:G6").HorizontalAlignment = xlCenter
+            .Range("C6:G6").Value = ledgerList2
+            .Range("C6:G6").Font.Name = "Calibri"
+            .Range("C6:G6").Font.Size = 11
+            .Range("C6:G6").Font.Bold = True
+
+            .Range("D8").Value = "Posting Date To"
+        End With
+
+        ' borders for the merged header row
+        Dim m As Integer
+        For m = 1 To 4 ' xlEdgeLeft to xlEdgeBottom
+            With xlData.Range("C6:G6").Borders(m)
+                .LineStyle = 1 ' xlContinuous
+                .Weight = 2    ' xlThin
+            End With
+        Next m
+
+        Call SetProperty("A7", "F21", xlWB, "Data")
+        Call InsertCompanyLogo(rsCust!Customer_Entity, xlData)
+
+        With xlData
+            .Activate
+            .Range("A25:Y25").AutoFilter
+            .Range("A25:Y25").Interior.Color = RGB(201, 201, 201)
+            
+            ' --- Analit_R "Initial setup" elements (safe, no UI dependency)
+            On Error Resume Next
+            .Range("G23").AutoFilter   ' benign if region doesn't apply
+            .Range("Q23").Interior.Color = 65535 ' yellow highlight
+            On Error GoTo 0
+        End With
+
+        '-------------------------------------------------------------
+        ' Overview sheet (pivot destination)
+        '-------------------------------------------------------------
+        Set xlOverview = GetOrCreateSheet(xlWB, "Overview")
+
+        Set srcRange = xlData.Range(xlData.Cells(25, 1), xlData.Cells(lastRow, lastCol))
+        SourceDataStr = "'" & xlData.Name & "'!" & srcRange.Address(False, False)
+        Set pc = xlWB.PivotCaches.Create(SourceType:=xlDatabase, SourceData:=SourceDataStr)
+        Set destRange = xlOverview.Range("A26")
+        Set pt = pc.CreatePivotTable(TableDestination:=destRange, TableName:="PivotTable1")
+        pt.RowAxisLayout xlTabularRow
+
+        ' --- initial pivot fields
+        On Error Resume Next
+        With pt
+            .PivotFields("Customer").Orientation = xlRowField
+            .PivotFields("Segment5").Orientation = xlRowField
+            .PivotFields("Segment4").Orientation = xlRowField
+            .PivotFields("Segment 4 Name").Orientation = xlRowField
+            .PivotFields("Source Contact Name").Orientation = xlRowField
+            .PivotFields("Description").Orientation = xlRowField
+            .PivotFields("PO Number").Orientation = xlRowField
+            .PivotFields("Posting Month").Orientation = xlColumnField
+            .PivotFields("Amount").Orientation = xlDataField
+            .PivotFields("Amount").Function = xlSum
+            .PivotFields("Amount").Name = "Sum of Amount"
+            .DataFields(1).NumberFormat = "#,##0.00"
+            
+            
+            Dim pvtField As Object
+            For Each pvtField In .PivotFields
+                If pvtField.Orientation = xlRowField Or pvtField.Orientation = xlColumnField Then
+                    pvtField.Subtotals = Array(False, False, False, False, False, False, _
+                                              False, False, False, False, False, False)
+                End If
+            Next pvtField
+            .TableStyle2 = "None"
+        End With
+        On Error GoTo 0
+
+        '-------------------------------------------------------------
+        ' Overview header & layout
+        '-------------------------------------------------------------
+        With xlOverview
+            .Range("A1:H1").Merge
+            .Range("A1:H1").HorizontalAlignment = xlCenter
+            .Range("A1").Value = "BE_050 Analytical - DIM 7-4-3-2 per month"
+            .Range("A1").Font.Name = "Calibri"
+            .Range("A1").Font.Size = 14
+            .Range("A1").Font.Bold = True
+            .Range("A1").ColumnWidth = 25.33
+
+            .Range("A7").Value = "Posting Date From"
+            .Range("A8").Value = "Document Nr."
+            .Range("A9").Value = "G/L Account Nr."
+            .Range("A10").Value = "Segment1"
+            .Range("A11").Value = "Segment2"
+            .Range("A12").Value = "Segment3"
+            .Range("A13").Value = "Segment4"
+            .Range("A14").Value = "Segment5"
+            .Range("A15").Value = "Segment6"
+            .Range("A16").Value = "Segment7"
+            .Range("A17").Value = "Segment8"
+            .Range("A18").Value = "Segment9"
+            .Range("A19").Value = "Segment10"
+            .Range("A20").Value = "Include Adjustment Period"
+
+            .Range("B7").Value = firstOfMinMonth
+            .Range("B7").NumberFormat = "dd/mm/yyyy"
+            .Range("B10").Value = ledgerList
+            .Range("E7").Value = DateSerial(Year(postingMonthMax), month(postingMonthMax) + 1, 0)
+            .Range("E7").NumberFormat = "dd/mm/yyyy"
+
+            .Range("B15").Value = rsCust!Customer_Name
+
+            ' *** CHANGED per spec:
+                       
+            .Range("B13").Value = ""             ' Overview!B13 must be empty
+            .Range("B14").Value = seg5ListText   ' Overview!B14 = UNIQUE PIPE list
+            .Range("B13:B14").WrapText = False   ' keep on one line
+
+
+
+            .Range("B20").Value = "Yes"
+
+            .Range("C6:F6").Merge
+            .Range("C6:F6").HorizontalAlignment = xlCenter
+            .Range("C6:F6").Value = ledgerList2
+            .Range("C6:F6").Font.Name = "Calibri"
+            .Range("C6:F6").Font.Size = 11
+            .Range("C6:F6").Font.Bold = True
+
+            .Range("D7").Value = "Posting Date To"
+            .Range("B1:I1").ColumnWidth = 32.3
+        End With
+
+        ' borders for the merged header row on Overview
+        Dim n As Integer
+        For n = 1 To 4
+            With xlOverview.Range("C6:F6").Borders(n)
+                .LineStyle = 1
+                .Weight = 2
+            End With
+        Next n
+
+        Call SetProperty("A7", "F20", xlWB, "Overview")
+        Call InsertCompanyLogo(rsCust!Customer_Entity, xlOverview)
+
+        '-------------------------------------------------------------
+        ' Analit_R macro integration on Pivot: hide fields, sort, PO#, subtotals, widths, highlights
+        '-------------------------------------------------------------
+        On Error Resume Next
+        ' Hide not-needed fields
+        PivotHideIfExists pt, "Ledger"
+        PivotHideIfExists pt, "Segment8 (Dim7)"
+        PivotHideIfExists pt, "Segment8 Name"
+        PivotHideIfExists pt, "Segment 5 Name"
+        PivotHideIfExists pt, "Segment2"
+        PivotHideIfExists pt, "Project"
+        PivotHideIfExists pt, "GL Account Nr."
+        PivotHideIfExists pt, "GL Account Nr"
+        PivotHideIfExists pt, "G/L Account Nr"
+        PivotHideIfExists pt, "GL Account Name"
+        PivotHideIfExists pt, "Document Nr"
+        PivotHideIfExists pt, "External Document Nr"
+
+        ' Ensure PO Number is row field at position 6
+        PivotEnsureRowField pt, "PO Number", 6
+        PivotEnsureRowField pt, "Source Contact Name", 5
+
+        ' Sort posting month ascending
+        pt.PivotFields("Posting Month").AutoSort xlAscending, "Posting Month"
+
+        ' Column adjustments
+        With xlOverview
+            .Columns("A:A").ColumnWidth = 17
+            .Columns("F:F").EntireColumn.AutoFit
+            .Columns("F:F").ColumnWidth = 20.78
+        End With
+
+        ' Enable subtotals for specific fields
+        Dim arrNames As Variant, k As Long
+        arrNames = Array("Customer", "Segment5", "Segment4", "Segment 4 Name")
+        For k = LBound(arrNames) To UBound(arrNames)
+            pt.PivotFields(arrNames(k)).Subtotals(1) = True
+        Next k
+
+        
+        
+        ' Highlight subtotal rows for Segment4 and Segment5 (no Selection, field-aware)
+            Const xlCellTypeVisible As Long = 12
+            Const xlPivotCellSubtotal As Long = 2
+            Dim rngVis As Object, c As Object, rowBand As Object
+            Dim ws As Object: Set ws = xlOverview
+            Dim lastColl As Long: lastColl = pt.TableRange1.Columns(pt.TableRange1.Columns.Count).Column
+            Dim startCol As Long
+            ' Avoid repeated shading on the same physical row for each field
+            Dim doneRows4 As Object, doneRows5 As Object
+            Set doneRows4 = CreateObject("Scripting.Dictionary")
+            Set doneRows5 = CreateObject("Scripting.Dictionary")
+    
+            Set rngVis = pt.TableRange1.SpecialCells(xlCellTypeVisible)
+            For Each c In rngVis
+                If Not c.PivotCell Is Nothing Then
+                    With c.PivotCell
+                        ' --- Segment4 subtotal row only ---
+                        If .PivotCellType = xlPivotCellSubtotal _
+                           And StrComp(.PivotField.Name, "Segment4", vbTextCompare) = 0 _
+                           And Not doneRows4.exists(c.row) Then
+                            doneRows4.Add c.row, True
+                            startCol = FieldLabelColumn(pt, "Segment4")
+                            If startCol < pt.TableRange1.Column Then startCol = pt.TableRange1.Column
+                            Set rowBand = ws.Range(ws.Cells(c.row, startCol), ws.Cells(c.row, lastColl))
+                           
+                            With rowBand.Interior
+                                .Pattern = 1                    ' xlSolid
+                                .PatternColorIndex = -4105      ' xlAutomatic
+                                .Color = ColorSeg4()            ' <-- RGB color for Segment4
+                                .TintAndShade = 0               ' keep exact RGB
+                                .PatternTintAndShade = 0
+                            End With
+
+                        End If
+                        ' --- Segment5 subtotal row only ---
+                        If .PivotCellType = xlPivotCellSubtotal _
+                           And StrComp(.PivotField.Name, "Segment5", vbTextCompare) = 0 _
+                           And Not doneRows5.exists(c.row) Then
+                            doneRows5.Add c.row, True
+                            startCol = FieldLabelColumn(pt, "Segment5")
+                            If startCol < pt.TableRange1.Column Then startCol = pt.TableRange1.Column
+                            Set rowBand = ws.Range(ws.Cells(c.row, startCol), ws.Cells(c.row, lastColl))
+                            
+                            With rowBand.Interior
+                                .Pattern = 1                    ' xlSolid
+                                .PatternColorIndex = -4105      ' xlAutomatic
+                                .Color = ColorSeg5()            ' <-- RGB color for Segment5
+                                .TintAndShade = 0               ' keep exact RGB
+                                .PatternTintAndShade = 0
+                             End With
+                          End If
+                            End With
+                             End If
+                              Next c
+
+
+
+        On Error GoTo 0
+
+        '-------------------------------------------------------------
+        ' Capture pivot order BEFORE closing (for PDF merge later)
+        '-------------------------------------------------------------
+        Dim pivOrder As Variant
+        pivOrder = GetPivotOrder(xlOverview)
+
+        '=================================================================
+        ' SAVE THE EXCEL FILE – robust version
+        '=================================================================
+        savePath = Nz(rsCust!Customer_Path, "")
+        fullPath = BuildFullPathSafe(Nz(rsCust!Customer_Path, ""), rsCust!Customer_Name)
+        If Len(fullPath) = 0 Then
+            LogProblem CLng(rsCust!Customer_ID), rsCust!Customer_Name, _
+                       "BuildFullPathSafe failed – folder may be missing or path too long."
+            GoTo CloseWorkbookAndNext
+        End If
+
+        ' ensure the folder really exists (second guard)
+        Dim targetFolder As String
+        targetFolder = Left$(fullPath, InStrRev(fullPath, "\") - 1)
+        If Dir(targetFolder, vbDirectory) = "" Then
+            On Error Resume Next
+            MkDir targetFolder
+            If Err.Number <> 0 Then
+                LogProblem CLng(rsCust!Customer_ID), rsCust!Customer_Name, _
+                           "Could not create folder '" & targetFolder & "' – " & Err.Description
+                Err.Clear
+                GoTo CloseWorkbookAndNext
+            End If
+            On Error GoTo 0
+        End If
+
+        ' Save workbook
+        On Error GoTo SaveFailed
+        xlWB.SaveAs fileName:=fullPath, FileFormat:=xlOpenXMLWorkbook, _
+                    ConflictResolution:=xlLocalSessionChanges
+        On Error GoTo 0
+
+        
+    DoEvents
+             xlWB.Close SaveChanges:=False
+             Set xlWB = Nothing
+           
+CloseWorkbookAndNext:
+            ' close per-customer objects safely
+            On Error Resume Next
+            If Not rsData Is Nothing Then rsData.Close: Set rsData = Nothing
+            On Error GoTo 0
+            ' advance and continue the customer loop
+            rsCust.MoveNext
+        Loop
+
+
+  
+    ' FINAL CLEAN-UP
+    
+        If Not rsCust Is Nothing Then rsCust.Close: Set rsCust = Nothing
+         Set db = Nothing
+         If Not xlApp Is Nothing Then xlApp.Quit: Set xlApp = Nothing
+         MsgBox "Export completed successfully!", vbInformation
+         Exit Sub
+    
+'    Call SendCustomerEmails
+
+    MsgBox "Export and email process completed successfully!", vbInformation
+    Exit Sub
+
+'---------------------------
+' Error handling for SaveAs
+'---------------------------
+SaveFailed:
+    
+Dim errMsg As String
+     errMsg = "SaveAs failed – " & Err.Number & ": " & Err.Description & _
+              ". FullPath='" & fullPath & "'"
+     LogProblem CLng(rsCust!Customer_ID), rsCust!Customer_Name, errMsg
+     Err.Clear
+     On Error Resume Next
+     If Not xlWB Is Nothing Then xlWB.Close SaveChanges:=False
+     On Error GoTo 0
+     GoTo CloseWorkbookAndNext
+
+
+'---------------------------
+' General error handler
+'---------------------------
+ErrHandler:
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, "Export failed"
+    Resume CleanUp
+CleanUp:
+    On Error Resume Next
+    If Not rsData Is Nothing Then rsData.Close: Set rsData = Nothing
+    If Not rsCust Is Nothing Then rsCust.Close: Set rsCust = Nothing
+    If Not xlWB Is Nothing Then xlWB.Close False: Set xlWB = Nothing
+    If Not xlApp Is Nothing Then xlApp.Quit: Set xlApp = Nothing
+    
+   
+    
+    End Sub
+
