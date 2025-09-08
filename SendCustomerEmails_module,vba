@@ -1,0 +1,174 @@
+Option Compare Database
+Option Explicit
+
+Public g_ReportMonth As Date   ' <-- GLOBAL REPORT MONTH
+'---------------------------------------------------------------------
+' Build a safe full path for the Excel workbook (updated base name)
+'---------------------------------------------------------------------
+Public Function BuildFullPathSafe( _
+    savePath As String, _
+    custName As String) As String
+    
+    Dim fName As String, folderPath As String, fullPath As String
+    Dim yearVal As String, monthVal As String, monthFolder As String
+    
+    'check month validation
+'    If Year(g_ReportMonth) < 2000 Then
+'        g_ReportMonth = Date  ' daca a ie?it anul 1899, for?am luna curenta
+'    End If
+
+    ' Use global report month
+    yearVal = Format(g_ReportMonth, "yyyy")
+    monthVal = Format(g_ReportMonth, "mm")
+    monthFolder = yearVal & monthVal
+
+    ' Clean customer name of illegal characters
+    fName = CleanFileName(custName)
+    If Len(fName) = 0 Then Exit Function
+    
+    ' Ensure base folder ends with "\"
+    folderPath = Trim(savePath)
+    If Right(folderPath, 1) <> "\" Then folderPath = folderPath & "\"
+    
+    ' Build monthly folder path
+    folderPath = folderPath & monthFolder & "\"
+    
+    ' Create folder if missing
+    If Dir(folderPath, vbDirectory) = "" Then
+        On Error Resume Next
+        MkDir folderPath
+        On Error GoTo 0
+    End If
+    
+    ' Final filename: YYYYMM Analytische lijst [Customer_Name].xlsx
+    fullPath = folderPath & yearVal & monthVal & _
+               " Analytische lijst " & fName & ".xlsx"
+    
+    If Len(fullPath) > 215 Then Exit Function
+    BuildFullPathSafe = fullPath
+End Function
+'=====================================================================
+' 1) Helper: remove illegal characters from a file name
+'=====================================================================
+Public Function CleanFileName(s As String) As String
+    Dim illegal As Variant, ch As Variant
+    illegal = Array("\", "/", ":", "*", "?", """", "<", ">", vbLf)
+    For Each ch In illegal
+        s = Replace(s, ch, "_")
+    Next ch
+    s = Trim(s)
+    Do While Right$(s, 1) = "." Or Right$(s, 1) = " "
+        s = Left$(s, Len(s) - 1)
+    Loop
+    CleanFileName = s
+End Function
+'=====================================================================
+'  Month reporting initiation
+'=====================================================================
+Sub InitReportMonth()
+    Dim db As DAO.Database
+    Dim rsMonth As DAO.Recordset
+
+    Set db = CurrentDb
+    Set rsMonth = db.OpenRecordset("SELECT Max([Posting Date]) AS MaxDate FROM Consumables WHERE [Posting Date] Is Not Null", dbOpenSnapshot)
+    
+    If Not rsMonth.EOF And Not IsNull(rsMonth!MaxDate) Then
+        g_ReportMonth = rsMonth!MaxDate
+    Else
+        g_ReportMonth = Date  ' fallback to current month
+    End If
+
+    rsMonth.Close
+    Set rsMonth = Nothing
+    Set db = Nothing
+End Sub
+
+'=====================================================================
+' 3) Simple text-file logger (used for both Excel & PDF problems)
+'=====================================================================
+Public Sub LogProblem(ByVal custID As Long, _
+                      ByVal custName As String, _
+                      ByVal msg As String)
+    Dim logFile As String, txt As String
+    logFile = CurrentProject.Path & "\ExportLog.txt"
+    txt = Format(Now, "yyyy-mm-dd hh:nn:ss") & _
+          "  | CustID:" & custID & _
+          "  | CustName:" & custName & _
+          "  | " & msg & vbCrLf
+    On Error Resume Next
+    Dim f As Integer
+    f = FreeFile
+    Open logFile For Append As #f
+    Print #f, txt
+    Close #f
+    On Error GoTo 0
+End Sub
+
+
+Public Sub SendCustomerEmails()
+
+    Dim db As DAO.Database
+    Dim rsCust1 As DAO.Recordset
+    Dim outlookApp As Object, outlookMail As Object
+    Dim fso As Object, logFile As Object, logPath As String
+    Dim filePath As String
+
+    Dim yearVal As String, monthVal As String, monthFolder As String
+    yearVal = Format(g_ReportMonth, "yyyy")
+    monthVal = Format(g_ReportMonth, "mm")
+    monthFolder = yearVal & monthVal
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    logPath = Application.CurrentProject.Path & "\EmailLog.txt"
+    Set logFile = fso.OpenTextFile(logPath, 8, True)
+    
+    Call InitReportMonth
+    
+    On Error Resume Next
+    Set outlookApp = GetObject(, "Outlook.Application")
+    If outlookApp Is Nothing Then
+        Set outlookApp = CreateObject("Outlook.Application")
+    End If
+    On Error GoTo 0
+    If outlookApp Is Nothing Then
+        MsgBox "Outlook not available. Emails skipped.", vbExclamation
+        GoTo CleanExit
+    End If
+
+    Set db = CurrentDb
+    Set rsCust1 = db.OpenRecordset("SELECT * FROM Customer WHERE Customer_SendEmail = TRUE", dbOpenSnapshot)
+
+    Do While Not rsCust1.EOF
+        filePath = BuildFullPathSafe(Nz(rsCust1!Customer_Path, ""), rsCust1!Customer_Name)
+
+        If Len(filePath) > 0 And Dir(filePath) <> "" Then
+            Set outlookMail = outlookApp.CreateItem(0)
+            With outlookMail
+                .To = Nz(rsCust1!Customer_ToEmail, "")
+                .BCC = "dumitru.purcel@katoennatie.com; gheorghe.iamandii@katoennatie.com"
+                .Subject = "Analytische lijst " & rsCust1!Customer_Name & " " & Format(g_ReportMonth, "mmmm yyyy")
+                .body = "Hello," & vbCrLf & vbCrLf & _
+                        "Please find attached Analytische lijst " & rsCust1!Customer_Name & _
+                        " for " & Format(g_ReportMonth, "mmmm yyyy") & "." & vbCrLf & vbCrLf & _
+                        "Thanks."
+                .Attachments.Add filePath
+                .Send
+            End With
+            logFile.WriteLine "? Sent to " & rsCust1!Customer_Name & " | " & filePath
+        Else
+            logFile.WriteLine "? Missing file for " & rsCust1!Customer_Name & " | Expected: " & filePath
+        End If
+
+        rsCust1.MoveNext
+    Loop
+
+    rsCust1.Close
+    Set rsCust1 = Nothing
+
+CleanExit:
+    If Not logFile Is Nothing Then logFile.Close
+    Set logFile = Nothing
+    Set fso = Nothing
+    Set db = Nothing
+    Set outlookApp = Nothing
+End Sub
